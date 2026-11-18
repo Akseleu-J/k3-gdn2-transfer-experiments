@@ -18,10 +18,11 @@ Use the companion launcher notebook `K3_GDN2_Launcher_Colab.ipynb` (built from
 this repository; it contains only settings, `git clone` of this repo at a
 pinned commit, revision check and the documented CLI call):
 
-1. This repository is **private**: add a fine-grained GitHub read-only token
-   (Contents: Read, access limited to this repository) as a Colab Secret named
-   `GITHUB_READ_TOKEN`. The token is passed to `git` through the process
-   environment of the clone only — never in URLs, git config, logs or source.
+1. The repository is currently **public**: the notebooks clone it without any
+   credentials. If it is switched back to private, add a fine-grained GitHub
+   read-only token (Contents: Read, access limited to this repository) as a
+   Colab Secret named `GITHUB_READ_TOKEN`; the launcher uses it only for the
+   clone subprocess — never in URLs, git config, logs or source.
 2. `real` mode additionally accepts an optional `HF_TOKEN` Colab Secret for
    Kimi-K3 Hub access; public access is attempted without it.
 3. Run all. Results: `/content/k3_runs/<profile>-<RUN_ID>.zip` (+ `.sha256`),
@@ -62,6 +63,7 @@ establish model correctness or quality.
 
 ## License / status
 
-Private research code of the project team; not for redistribution. Historical
-notebooks with embedded source payloads are archived artifacts and must not be
+Research code of the project team, temporarily public (may return to private;
+no redistribution of derived training artifacts implied). Historical notebooks
+with embedded source payloads are archived artifacts and must not be
 re-submitted (KAGGLE_PROTOCOL.md §9).
