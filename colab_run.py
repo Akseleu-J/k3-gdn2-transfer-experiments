@@ -16,7 +16,8 @@ PACKAGES = ['jax[tpu]==0.11.2', 'flax==0.12.9', 'optax==0.2.6', 'requests',
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--profile', choices=('all', 'tiny', 'real'), default='tiny')
+    ap.add_argument('--profile', choices=('all', 'tiny', 'real', 'staged'), default='tiny')
+    ap.add_argument('--script', default='experiment.py', help='repo script to execute per phase (staged pipeline: staged_transfer.py)')
     ap.add_argument('--tiny-steps', type=int, default=30)
     ap.add_argument('--real-steps', type=int, default=0)
     ap.add_argument('--seq', type=int, default=128)
@@ -32,10 +33,14 @@ def parse_args():
 args = parse_args()
 assert args.tiny_steps >= 0 and args.real_steps >= 0 and args.seq >= 2 and args.real_batch >= 0
 RUNS = []
-if args.profile in ('all', 'tiny'):
-    RUNS.append(dict(mode='tiny', steps=args.tiny_steps, batch=1))
-if args.profile in ('all', 'real'):
-    RUNS.append(dict(mode='real', steps=args.real_steps, batch=args.real_batch))
+if args.script != 'experiment.py':
+    # Alternative pipeline scripts own their stages; the driver just provides env/venv/zip.
+    RUNS.append(dict(mode='staged', steps=0, batch=0))
+else:
+    if args.profile in ('all', 'tiny'):
+        RUNS.append(dict(mode='tiny', steps=args.tiny_steps, batch=1))
+    if args.profile in ('all', 'real'):
+        RUNS.append(dict(mode='real', steps=args.real_steps, batch=args.real_batch))
 assert RUNS, 'empty run plan'
 REPO_DIR = Path(__file__).resolve().parent
 RUN_ID = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex[:6]
@@ -114,6 +119,10 @@ def status(state, **kw):
 # Provenance copies: the archive carries the exact source bytes that ran.
 (RUN / 'experiment.py').write_text((REPO_DIR / 'experiment.py').read_text(encoding='utf-8'), encoding='utf-8')
 (RUN / 'colab_run.py').write_text(Path(__file__).read_text(encoding='utf-8'), encoding='utf-8')
+SCRIPT_NAME = Path(args.script).name
+(RUN / SCRIPT_NAME).write_text((REPO_DIR / args.script).read_text(encoding='utf-8'), encoding='utf-8')
+if (REPO_DIR / 'staged_core.py').is_file():
+    (RUN / 'staged_core.py').write_text((REPO_DIR / 'staged_core.py').read_text(encoding='utf-8'), encoding='utf-8')
 (RUN / 'run_plan.json').write_text(json.dumps({'profile': args.profile, 'phases': RUNS, 'seq': args.seq,
                                                'repo_sha': args.repo_sha, 'k3_revision': args.k3_revision,
                                                'source_sha256': {n: hashlib.sha256((REPO_DIR / n).read_bytes()).hexdigest()
@@ -200,7 +209,7 @@ try:
         env.update(K3_MODE=phase['mode'], K3_STEPS=str(phase['steps']), K3_BATCH=str(phase['batch']),
                    K3_ARTIFACTS=str(ART / phase['mode']))
         status('RUNNING_' + phase['mode'].upper()); snapshot()
-        code = execute([str(python), str(RUN / 'experiment.py')], env)
+        code = execute([str(python), str(RUN / SCRIPT_NAME)], env)
         if code:
             raise RuntimeError(f"phase {phase['mode']} failed with exit code {code}; later phases stopped")
     status('COMPLETED', exit_code=0, archive_errors=archive_errors)
