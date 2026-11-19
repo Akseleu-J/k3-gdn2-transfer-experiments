@@ -10,7 +10,9 @@ this repository at a pinned full commit).
 | File | Role |
 |---|---|
 | `experiment.py` | The diagnostic itself: tiny (mechanism/backward gates, no weights) and real (loads pinned Kimi-K3 revision, checks transfer, measures CE(0), shuffled CE, unigram baseline, optional bounded training). Configured purely via environment variables: `K3_MODE`, `K3_STEPS`, `K3_SEQ`, `K3_BATCH`, `K3_ARTIFACTS`, `K3_REVISION`, `HF_TOKEN`. |
-| `colab_run.py` | Launcher driver: creates an isolated venv (`--without-pip` + parent-pip bootstrap), installs pinned dependencies, runs `experiment.py` per phase sequentially, writes `status.json`, keeps one atomic results ZIP (with `manifest.json` and SHA-256 sidecar) refreshed every 60 s, redacts secret-looking strings from logs and archives. Stdlib only. |
+| `colab_run.py` | Launcher driver: creates an isolated venv (`--without-pip` + parent-pip bootstrap), installs pinned dependencies, runs the selected script per phase (`--script`, default `experiment.py`), writes `status.json`, keeps one atomic results ZIP (with `manifest.json` and SHA-256 sidecar) refreshed every 60 s, redacts secret-looking strings from logs and archives. Stdlib only. |
+| `staged_core.py` | Math core of the staged pipeline: block-output orthogonality penalty, deterministic growth plan (block-aligned copies with `mixer_source` + distinct teacher FFN sources), ReZero-style function-preserving gates, stage report contract. 19 local unit checks in `test_staged_core.py`. |
+| `staged_transfer.py` | The staged pipeline itself (smoke and real paths): S1 base-block training on copied teacher layers, S2 growth by duplicating trained blocks with per-copy FFN from distinct teacher shared-experts layers and zero gates + function-preservation gate, S3 whole-volume warmup with the orthogonality penalty, S4 optional full training. See `STAGED_DESIGN.md` for the locked design and references. |
 
 ## How to run (Colab)
 
@@ -34,8 +36,24 @@ Manual equivalent without the notebook:
 git clone https://github.com/Akseleu-J/k3-gdn2-transfer-experiments.git
 cd k3-gdn2-transfer-experiments
 git checkout <PINNED_FULL_COMMIT_SHA>
-python colab_run.py --profile tiny --tiny-steps 30 --seq 128
+python colab_run.py --profile tiny --tiny-steps 30 --seq 128          # diagnostic
+python colab_run.py --profile staged --script staged_transfer.py      # staged pipeline (env knobs: K3_STAGED_RUN, K3_S1_STEPS, ...)
 ```
+
+## Staged pipeline summary
+
+Copy the first `K3_N_BASE` (default 8) teacher layers, re-initialize the new
+architecture components, train the base (S1); duplicate the trained blocks to
+`K3_TARGET` (default 16) with each copy's FFN replaced by the shared experts of
+a **distinct** teacher layer and zero residual gates so the grown model exactly
+reproduces the base function (S2, asserted); warm the whole volume with a
+MoE-style orthogonality penalty on pooled block outputs (S3); optional full
+training on the real dataset (S4, off by default). Motivation and prior work:
+depthwise stacking converges cross-stage within a few hundred steps
+(NeurIPS 2024 Spotlight), duplicating *different* layers beats identical
+duplication (ACL 2021), deep-layer redundancy motivates the diversity penalty
+(arXiv:2403.17887) — an explicit orthogonality loss between grown blocks is the
+under-explored piece this pipeline tests. Full contract: `STAGED_DESIGN.md`.
 
 ## Dependencies (installed into the isolated venv by `colab_run.py`)
 
