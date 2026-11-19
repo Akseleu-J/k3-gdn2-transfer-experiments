@@ -42,32 +42,40 @@ def orthogonality_penalty(block_outputs, lam, scope='all', eps=1e-6):
     return lam * mean_off, gram
 
 
-def build_growth_plan(n_base, target_layers, teacher_ffn_layers, strategy='spread'):
+def build_growth_plan(n_base, target_layers, teacher_ffn_layers, strategy='spread', layers_per_block=4):
     """Deterministic plan: which teacher FFN initializes each student block.
 
-    Base blocks 0..n_base-1 keep their own teacher layers. Each copy k takes a
-    distinct teacher FFN source (bert2BERT found duplicating *different*
-    layers beats identical duplication); 'spread' picks them evenly across the
-    unused teacher depth, 'cycle' repeats when teacher depth is exhausted.
+    Base blocks 0..n_base-1 keep their own teacher layers and S1-trained state
+    (gate_init None = loaded from the S1 checkpoint). Each copy duplicates a
+    trained base block (mixer_source) and takes a *distinct* teacher FFN source
+    (bert2BERT found duplicating *different* layers beats identical
+    duplication); 'spread' picks sources evenly across the unused teacher
+    depth, 'cycle' repeats when teacher depth is exhausted.
     """
     assert n_base >= 1 and target_layers >= n_base, 'growth must keep or add depth'
     assert len(teacher_ffn_layers) >= n_base, 'teacher must provide the base FFN sources'
+    assert n_base % layers_per_block == 0 and target_layers % layers_per_block == 0, 'block-aligned depths required'
+    n_base_blocks = n_base // layers_per_block
     plan = []
-    for b in range(target_layers):
+    for b in range(0, target_layers, layers_per_block):
         if b < n_base:
-            # base blocks load their S1-trained state; gate_init None = from checkpoint
-            plan.append(dict(block=b, role='base', ffn_source=teacher_ffn_layers[b], gate_init=None))
+            for i in range(layers_per_block):
+                plan.append(dict(block=b + i, role='base', mixer_source=b + i,
+                                 ffn_source=teacher_ffn_layers[b + i], gate_init=None))
             continue
         pool = [t for t in teacher_ffn_layers if t >= n_base] or list(teacher_ffn_layers)
         if strategy == 'spread':
-            need = target_layers - n_base
+            copies = range(n_base, target_layers, layers_per_block)
+            need = len(copies)
             idx = [round(i * (len(pool) - 1) / max(need - 1, 1)) for i in range(need)]
-            src = pool[idx[b - n_base]]
+            src = pool[idx[(b - n_base) // layers_per_block]]
         elif strategy == 'cycle':
-            src = pool[(b - n_base) % len(pool)]
+            src = pool[((b - n_base) // layers_per_block) % len(pool)]
         else:
             raise ValueError('unknown ffn strategy: ' + str(strategy))
-        plan.append(dict(block=b, role='copy', ffn_source=src, gate_init=0.0))
+        for i in range(layers_per_block):
+            plan.append(dict(block=b + i, role='copy', mixer_source=(b % n_base) + i,
+                             ffn_source=src, gate_init=0.0))
     return plan
 
 
