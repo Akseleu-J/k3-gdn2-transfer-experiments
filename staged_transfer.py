@@ -425,6 +425,17 @@ if RUN == 'smoke':
 else:
     # ---- teacher fetch (copied from reviewed experiment.py; provenance identical) ----
     REPO = 'moonshotai/Kimi-K3'; REV = K3_SHA
+    # Geometry drift gate, mirroring the reviewed experiment.py real mode.
+    source_config = json.loads(http_get(hf_url('config.json')))
+    Path(ARTIFACTS, 'k3_config.json').write_text(json.dumps(source_config, indent=2), encoding='utf-8')
+    tc = source_config['text_config']
+    expected = {'hidden_size': 7168, 'num_attention_heads': 96, 'qk_nope_head_dim': 128,
+                'qk_rope_head_dim': 64, 'v_head_dim': 128, 'tie_word_embeddings': False, 'mla_use_output_gate': True}
+    for k, v in expected.items(): chk('CONFIG', k, tc.get(k) == v, str(tc.get(k)))
+    chk('CONFIG', 'safe_gate', tc['linear_attn_config'].get('gate_lower_bound') == -5.0)
+    actual_mla = tuple(i - 1 for i in tc['linear_attn_config']['full_attn_layers'] if i <= TARGET)
+    chk('CONFIG', 'layer_mapping', actual_mla == tuple(p for p in (3, 7, 11, 15) if p < TARGET), actual_mla)
+    REPORT['k3_geometry'] = {'hidden_size': tc['hidden_size'], 'mla_positions': actual_mla}; save_rpt()
     HF_HEADERS = {'Authorization': f'Bearer {HF_TOKEN}'} if HF_TOKEN else {}
     def hf_url(path): return f'https://huggingface.co/{REPO}/resolve/{REV}/{path}'
     def http_get(url, byte_range=None, retries=4):
@@ -596,7 +607,14 @@ if S1_STEPS: save_trainable('S1_base', tr1)
 chk('S1', 'completed', rep1['status'] == 'COMPLETED', rep1.get('last', {}).get('ce'))
 
 # ----------------------------- S2: growth -----------------------------
-pool = list(range(N_BASE, 93)) if RUN == 'real' else []
+if RUN == 'real':
+    # Teacher depth from the actual index, not an assumed constant.
+    max_teacher_layer = max(int(m.split('.')[3]) for m in wm if m.startswith('language_model.model.layers.'))
+    pool = list(range(N_BASE, max_teacher_layer + 1))
+    REPORT['teacher_depth'] = max_teacher_layer + 1
+else:
+    pool = []
+save_rpt()
 plan = build_growth_plan(N_BASE, TARGET, pool if pool else list(range(N_BASE, TARGET)) if TARGET > N_BASE else [N_BASE],
                          strategy='spread')
 if RUN == 'smoke':
