@@ -1,0 +1,41 @@
+name: ci
+on: [push, workflow_dispatch]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned stack (CPU variant of the Colab/TPU pins)
+        run: pip install -r requirements-ci.txt
+      - name: Core unit checks
+        run: python test_staged_core.py
+      - name: Model-level checks
+        run: python test_staged_model.py
+      - name: Micro smoke, arm new_lm_head (A+B)
+        env:
+          K3_STAGED_RUN: smoke
+          K3_S1_STEPS: 2
+          K3_S3_STEPS: 2
+          K3_SEQ: 16
+          K3_BATCH: 1
+          K3_ARTIFACTS: .qa_ci_lm
+          K3_S1_TRAINABLE: new_lm_head
+          K3_ALLOW_HIGH_CE0: '1'
+        run: python staged_transfer.py
+      - name: Micro smoke, baseline arm
+        env:
+          K3_STAGED_RUN: smoke
+          K3_S1_STEPS: 2
+          K3_S3_STEPS: 2
+          K3_SEQ: 16
+          K3_BATCH: 1
+          K3_ARTIFACTS: .qa_ci_base
+          K3_S1_TRAINABLE: new
+          K3_ALLOW_HIGH_CE0: '0'
+        run: python staged_transfer.py
+      - name: Driver CLI sanity
+        run: python colab_run.py --help > /dev/null

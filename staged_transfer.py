@@ -665,7 +665,6 @@ def run_pipeline():
     params_base = jax.device_put(params_host, sharded_like(base_abstract))
     pflat = flatten_dict(params_base, sep='/')
     mask1 = trainable_mask(pflat, 'new', [], extra_prefixes=('lm_head/',) if S1_TRAINABLE == 'new_lm_head' else ())
-    REPORT['S1_reference']['s1_trainable'] = S1_TRAINABLE
     tr1 = to_master(unflatten_dict({k: pflat[k] for k in pflat if mask1[k]}, sep='/'))
     fr1 = unflatten_dict({k: pflat[k] for k in pflat if not mask1[k]}, sep='/')
     tx1 = make_tx(tr1); op1 = tx1.init(tr1)
@@ -683,7 +682,8 @@ def run_pipeline():
     counts = np.bincount(train_ids, minlength=base_cfg.vocab).astype(np.float64) + 1.0
     uni_ce = float(np.mean(-np.log((counts[train_ids[:200000]] / counts.sum()))))
     threshold = min(math.log(base_cfg.vocab), uni_ce)
-    REPORT['S1_reference'] = {'ce0_val': ce0, 'unigram_ce_train': uni_ce, 'stop_threshold': threshold}; save_rpt()
+    REPORT['S1_reference'] = {'ce0_val': ce0, 'unigram_ce_train': uni_ce, 'stop_threshold': threshold,
+                              's1_trainable': S1_TRAINABLE, 'gate_bypassed': False}; save_rpt()
     chk('S1', 'finite_ce0', np.isfinite(ce0), ce0)
     if RUN == 'real' and ce0 >= threshold:
         if not ALLOW_HIGH_CE0:
