@@ -19,6 +19,7 @@ Env interface (defaults for a bounded mechanics test):
   K3_S1_STEPS / K3_S3_STEPS / K3_S4_STEPS   optimizer steps per stage (S4 off at 0)
   K3_LAMBDA_ORTH (1e-2), K3_CKA_TOKENS (512)
   K3_N_BASE (8), K3_TARGET (16), K3_SEQ, K3_BATCH (0 = device count)
+  K3_S1_TRAINABLE new|new_lm_head, K3_ALLOW_HIGH_CE0 1|0 (preregistered diagnostic bypass)
   K3_ARTIFACTS, K3_CACHE_DIR, K3_ENWIK8_PATH, K3_REVISION, HF_TOKEN, K3_SEED
 Scope: candidate student; no teacher parity, speed or quality claims.
 """
@@ -43,6 +44,8 @@ TARGET = int(os.environ.get('K3_TARGET', 16))
 SEQ = int(os.environ.get('K3_SEQ', 64 if RUN == 'smoke' else 128))
 BATCH_REQUESTED = int(os.environ.get('K3_BATCH', 0))
 SEED = int(os.environ.get('K3_SEED', 0))
+S1_TRAINABLE = os.environ.get('K3_S1_TRAINABLE', 'new')  # 'new' or 'new_lm_head' (diagnostic arm A+B)
+ALLOW_HIGH_CE0 = os.environ.get('K3_ALLOW_HIGH_CE0', '0') == '1'  # preregistered gate bypass
 ARTIFACTS = os.environ.get('K3_ARTIFACTS', 'artifacts')
 os.makedirs(ARTIFACTS, exist_ok=True)
 REPORT = {'run': RUN, 'revision': '2-audit-2026-11-19', 'status': 'RUNNING', 'results': [],
@@ -272,12 +275,12 @@ import jax.tree_util as jtu
 NEW_PAT = re.compile(r'/dar/|/erase_gate/|/write_gate/|/dt_bias$|/pre_ffn_norm/scale$')
 
 
-def trainable_mask(flat, policy, copy_blocks):
+def trainable_mask(flat, policy, copy_blocks, extra_prefixes=()):
     out = {}
     for k in flat:
         new = bool(NEW_PAT.search(k))
         in_copy = any(k.startswith(f'block_{b}/') for b in copy_blocks)
-        out[k] = new or (policy == 'all') or (policy == 'blocks' and in_copy)
+        out[k] = new or (policy == 'all') or (policy == 'blocks' and in_copy)             or any(k.startswith(p) for p in extra_prefixes)
     return out
 
 
@@ -661,7 +664,8 @@ def run_pipeline():
 
     params_base = jax.device_put(params_host, sharded_like(base_abstract))
     pflat = flatten_dict(params_base, sep='/')
-    mask1 = trainable_mask(pflat, 'new', [])
+    mask1 = trainable_mask(pflat, 'new', [], extra_prefixes=('lm_head/',) if S1_TRAINABLE == 'new_lm_head' else ())
+    REPORT['S1_reference']['s1_trainable'] = S1_TRAINABLE
     tr1 = to_master(unflatten_dict({k: pflat[k] for k in pflat if mask1[k]}, sep='/'))
     fr1 = unflatten_dict({k: pflat[k] for k in pflat if not mask1[k]}, sep='/')
     tx1 = make_tx(tr1); op1 = tx1.init(tr1)
@@ -682,7 +686,11 @@ def run_pipeline():
     REPORT['S1_reference'] = {'ce0_val': ce0, 'unigram_ce_train': uni_ce, 'stop_threshold': threshold}; save_rpt()
     chk('S1', 'finite_ce0', np.isfinite(ce0), ce0)
     if RUN == 'real' and ce0 >= threshold:
-        raise RuntimeError(f'S1 CE(0) {ce0:.3f} >= threshold {threshold:.3f} (ln vocab or unigram); staged run stopped (heuristic)')
+        if not ALLOW_HIGH_CE0:
+            raise RuntimeError(f'S1 CE(0) {ce0:.3f} >= threshold {threshold:.3f} (ln vocab or unigram); staged run stopped (heuristic)')
+        REPORT['S1_reference']['gate_bypassed'] = True
+        REPORT['S1_reference']['gate_bypass_note'] = 'preregistered diagnostic arm A+B (AUDIT_RUNS_2026-11-21); no quality claim from this run'
+        save_rpt(); print('[gate] CE(0) stop bypassed by preregistered diagnostic flag; no quality claim', flush=True)
     tr1, op1, rep1 = run_stage('S1', base_model, tr1, fr1, tx1, op1, S1_STEPS, train_ids, 'S1_base', 1, collect_gram=False, extra={'ce0_val': ce0})
     if S1_STEPS: save_trainable('S1_base', tr1)
     chk('S1', 'completed', rep1['status'] == 'COMPLETED', rep1.get('last', {}).get('ce'))

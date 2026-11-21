@@ -109,4 +109,12 @@ check('gradient_flows_to_copy_params', float(np.abs(np.asarray(grads['block_2'][
       'CKA on contributions gives grad at zero-init (audit F1)')
 check('ce_finite_step', np.isfinite(float(ce)), f'ce={float(ce):.4f}')
 
+# (iv) A+B arm: lm_head-trainable mask (audit run 2 follow-up)
+mask_default = trainable_mask(flat_grown, 'new', [])
+mask_lm = trainable_mask(flat_grown, 'new', [], extra_prefixes=('lm_head/',))
+lm_keys = [k for k in flat_grown if k.startswith('lm_head/')]
+check('mask_default_excludes_lm_head', all(not mask_default[k] for k in lm_keys))
+check('mask_new_lm_head_includes_lm_head', all(mask_lm[k] for k in lm_keys) and len(lm_keys) == 1)
+check('mask_new_lm_head_superset', all(mask_lm[k] == (mask_default[k] or k.startswith('lm_head/')) for k in flat_grown))
+
 print(f'ALL {len(results)} STAGED-MODEL CHECKS PASS')
