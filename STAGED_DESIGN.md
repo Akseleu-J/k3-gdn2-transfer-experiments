@@ -5,6 +5,32 @@ Core operators implemented and unit-tested in `staged_core.py` (18 checks PASS);
 the full pipeline lives in `staged_transfer.py`. Scope: candidate student, no
 teacher parity claim anywhere.
 
+## Revision 2 (2026-11-20, after AUDIT_RESPONSE_2026-11-19)
+
+Supersedes the gate/penalty parts of the sections below where they conflict.
+
+- **Growth identity**: copies duplicate their source block wholesale, with
+  mixer `o_proj`, FFN `down_proj` and DAR `alpha_scale` zero-initialized
+  (LLaMA Pro style) instead of a scalar `block_gate`. Exact identity at growth,
+  full-rank functional tangent from step one. DAR math is identical to
+  experiment.py (no double-added DAR).
+- **Anti-redundancy loss**: centered linear CKA (`staged_core.cka_penalty`)
+  between PRE-PROJECTION contributions (mixer before `o_proj`, FFN hidden
+  before `down_proj`), only on (copy, source) and (copy, copy) pairs. Gradient
+  reaches copy parameters while outputs are still exactly zero. The
+  residual-stream `orthogonality_penalty` is deprecated (kept for A/B only).
+- **S2 gate**: structural (all copy output leaves exactly zero) + numeric
+  (max|Δlogits| ≤ 4 bf16 ulps at max|logit|, KL ≤ 1e-4). Bitwise equality is
+  informational: two compiled bf16 programs differ by a few ulps even for the
+  same model (local: eager vs jit 4.1e-2).
+- **S2 source state**: growth uses the S1-TRAINED parameters.
+- **Optimizer**: fp32 master copy of the trainable subtree; AdamW with weight
+  decay only on ≥2D matrices.
+- **Data/eval**: disjoint held-out slice (enwik8 bytes 95.0M–95.2M), stage-folded
+  data keys, `ce_val_end` after S1 and S3, stop threshold min(ln V, unigram CE).
+- **Copy FFN sources (real)**: `depth_proportional` over teacher layers with
+  shared experts present, excluding the last two layers.
+
 ## Locked decisions (user, 2026-11-18)
 
 | Decision | Value |
