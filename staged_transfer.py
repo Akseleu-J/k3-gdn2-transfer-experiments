@@ -93,6 +93,13 @@ def sharded_like(abstract):
     return jax.tree_util.tree_map(lambda a: NamedSharding(mesh, fsdp_spec(a.shape)), abstract)
 
 
+def reshard_host(tree):
+    """Explicit sharded placement for host/device trees (audit run_082324): without
+    it, eager fp32 masters and Adam state for lm_head (~14 GB in arm A+B) land on
+    one chip and HBM OOMs at tx.init (4.38 G single buffer)."""
+    return jax.device_put(tree, jax.tree_util.tree_map(lambda v: NamedSharding(mesh, fsdp_spec(np.shape(v))), tree))
+
+
 REPORT['env'] = {'python': sys.version, 'jax': jax.__version__, 'backend': jax.default_backend(),
                  'devices': [str(x) for x in devices], 'run': RUN, 'stages': {'S1': S1_STEPS, 'S3': S3_STEPS, 'S4': S4_STEPS},
                  'lambda_orth': LAMBDA_ORTH, 'cka_tokens': CKA_TOKENS, 'n_base': N_BASE, 'target': TARGET,
@@ -665,8 +672,10 @@ def run_pipeline():
     params_base = jax.device_put(params_host, sharded_like(base_abstract))
     pflat = flatten_dict(params_base, sep='/')
     mask1 = trainable_mask(pflat, 'new', [], extra_prefixes=('lm_head/',) if S1_TRAINABLE == 'new_lm_head' else ())
-    tr1 = to_master(unflatten_dict({k: pflat[k] for k in pflat if mask1[k]}, sep='/'))
-    fr1 = unflatten_dict({k: pflat[k] for k in pflat if not mask1[k]}, sep='/')
+    tr1 = reshard_host(to_master(unflatten_dict({k: pflat[k] for k in pflat if mask1[k]}, sep='/')))
+    fr1 = reshard_host(unflatten_dict({k: pflat[k] for k in pflat if not mask1[k]}, sep='/'))
+    del params_base, pflat, params_host
+    gc.collect()
     tx1 = make_tx(tr1); op1 = tx1.init(tr1)
 
     def eval_ce(model, tr, fr, ids, n_batches=2):
@@ -778,8 +787,10 @@ def run_pipeline():
     # ----------------------------- S3: warmup with CKA penalty on contributions -----------------------------
     pg = flatten_dict(params_grown, sep='/')
     mask3 = trainable_mask(pg, 'blocks', copy_block_ids)
-    tr3 = to_master(unflatten_dict({k: pg[k] for k in pg if mask3[k]}, sep='/'))
-    fr3 = unflatten_dict({k: pg[k] for k in pg if not mask3[k]}, sep='/')
+    tr3 = reshard_host(to_master(unflatten_dict({k: pg[k] for k in pg if mask3[k]}, sep='/')))
+    fr3 = reshard_host(unflatten_dict({k: pg[k] for k in pg if not mask3[k]}, sep='/'))
+    del params_grown, pg, new_flat
+    gc.collect()
     tx3 = make_tx(tr3); op3 = tx3.init(tr3)
     tr3, op3, rep3 = run_stage('S3', grown_model, tr3, fr3, tx3, op3, S3_STEPS, train_ids, 'S3_warmup', 3, collect_gram=True)
     if S3_STEPS: save_trainable('S3_warmup', tr3)
