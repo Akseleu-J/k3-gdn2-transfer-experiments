@@ -55,6 +55,22 @@ duplication (ACL 2021), deep-layer redundancy motivates the diversity penalty
 (arXiv:2403.17887) — an explicit orthogonality loss between grown blocks is the
 under-explored piece this pipeline tests. Full contract: `STAGED_DESIGN.md`.
 
+## Multi-arm packages and memory guard
+
+`colab_run.py --arms arms/<file>.json` runs each arm as an isolated process (own
+artifacts directory, timeout, soft deadline); a failed arm is recorded and later
+arms still run; `total_budget_sec` skips arms that no longer fit. `mem_guard.py`
+samples host RAM and disk passively (`memory_monitor.jsonl`), the pipeline samples
+accelerator allocator statistics (`hbm_monitor.jsonl`) and refuses to start on an
+occupied accelerator (exit 75). Between arms leftover processes are killed, and if
+memory is above the configured limits one full reset (fresh venv + reinstall) runs
+before the next arm (`memory_resets.json`).
+
+Do **not** use `os._exit(0)` in a notebook cell to clear memory in a background
+(commit) run: a CPU probe on Kaggle (2026-11-26) ended in `DeadKernelError`, later
+cells did not run and files written to `/kaggle/working` were not returned. Process
+isolation per arm gives the same clean device memory without ending the run.
+
 ## Dependencies (installed into the isolated venv by `colab_run.py`)
 
 `jax[tpu]==0.11.2`, `flax==0.12.9`, `optax==0.2.6`, `requests`,

@@ -1,0 +1,13 @@
+{
+  "package": "driver and memory-guard check (CPU, micro sizes): one arm fails on purpose, one finds a 'dirty accelerator' once, and the 0% host limit forces resets between arms",
+  "total_budget_sec": 1500,
+  "memory_guard": {"host_used_reset_pct": 0.0, "max_resets": 3, "settle_sec": 0, "sample_sec": 2},
+  "arms": [
+    {"name": "ok_default", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_S1_STEPS": 3, "K3_S3_STEPS": 3, "K3_EVAL_EVERY": 3}},
+    {"name": "must_fail", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_COPY_SOURCE": "bogus"}},
+    {"name": "dirty_once", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_S1_STEPS": 2, "K3_S3_STEPS": 2, "K3_TEST_DIRTY_ONCE": ".qa_dirty_marker"}},
+    {"name": "lmhead_budget", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_S1_STEPS": 2, "K3_S3_STEPS": 400, "K3_S1_TRAINABLE": "new_lm_head", "K3_ALLOW_HIGH_CE0": 1, "K3_STAGE_MAX_SEC": 5, "K3_EVAL_EVERY": 100, "K3_CKPT_MAX_LEAF_MB": 0.001}},
+    {"name": "aki_lam0", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_S1_STEPS": 2, "K3_S3_STEPS": 2, "K3_COPY_SOURCE": "teacher", "K3_LAMBDA_ORTH": 0}},
+    {"name": "ok_control", "timeout_sec": 900, "env": {"K3_STAGED_RUN": "smoke", "K3_TARGET": 8, "K3_S1_STEPS": 4}}
+  ]
+}

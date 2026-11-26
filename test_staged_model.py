@@ -117,4 +117,25 @@ check('mask_default_excludes_lm_head', all(not mask_default[k] for k in lm_keys)
 check('mask_new_lm_head_includes_lm_head', all(mask_lm[k] for k in lm_keys) and len(lm_keys) == 1)
 check('mask_new_lm_head_superset', all(mask_lm[k] == (mask_default[k] or k.startswith('lm_head/')) for k in flat_grown))
 
+# (iv) mixer outputs must reach the residual stream (regression: revision 2 dropped
+# `x = x + d`, so mixers only acted through DAR; experiment.py adds them directly)
+fb = flatten_dict(params_base, sep='/')
+z = {k: (np.zeros_like(np.asarray(v)) if k.endswith('/dar/alpha_scale') else v) for k, v in fb.items()}
+pz = unflatten_dict(z, sep='/')
+pert = dict(z); kk = 'block_0/layer_1/mixer/o_proj/kernel'
+pert[kk] = np.asarray(pert[kk]) + np.asarray(0.5, np.asarray(pert[kk]).dtype)
+l0 = np.asarray(base_model.apply({'params': pz}, probe_ids).astype(jnp.float32))
+l1 = np.asarray(base_model.apply({'params': unflatten_dict(pert, sep='/')}, probe_ids).astype(jnp.float32))
+check('mixer_reaches_residual_with_zero_dar', float(np.abs(l1 - l0).max()) > 1e-3, f'max|dlogits|={float(np.abs(l1 - l0).max()):.3e}')
+
+# (v) S2 localization diagnostics: shape, finiteness on a healthy model
+_, rb = grown_model.apply({'params': params_grown}, probe_ids, collect_blocks=True)
+import staged_transfer as st
+check('diag_shape', rb['diag'].shape == (4, 5, len(st.DIAG_FIELDS)), str(rb['diag'].shape))
+check('diag_finite_and_no_nonfinite_counts', bool(np.isfinite(np.asarray(rb['diag'])).all()) and float(np.asarray(rb['diag'])[..., 6:].sum()) == 0)
+rep_ = st.s2_diag_report(np.asarray(rb['diag']), np.asarray(rb['diag']), [2, 3], l0, l0, l0, (1.0, 1.0))
+check('diag_report_no_false_alarm', rep_['summary']['grown_first_nonfinite'] is None and rep_['summary']['nonfinite_logits']['grown_fp32'] == 0)
+bad = np.asarray(rb['diag']).copy(); bad[2, 1, 5] = np.inf
+check('diag_report_localizes_inf', st.s2_diag_report(bad, bad, [2, 3], l0, l0, l0, (1.0, 1.0))['summary']['grown_first_nonfinite']['block'] == 2)
+
 print(f'ALL {len(results)} STAGED-MODEL CHECKS PASS')

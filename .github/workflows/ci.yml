@@ -15,6 +15,8 @@ jobs:
         run: python test_staged_core.py
       - name: Model-level checks
         run: python test_staged_model.py
+      - name: Memory guard checks
+        run: python test_mem_guard.py
       - name: Micro smoke, arm new_lm_head (A+B)
         env:
           K3_STAGED_RUN: smoke
@@ -39,3 +41,41 @@ jobs:
         run: python staged_transfer.py
       - name: Driver CLI sanity
         run: python colab_run.py --help > /dev/null
+      - name: Package arms file is valid (names, K3_* env only, timeouts within 8 h)
+        run: |
+          python - <<'PY'
+          import json, re
+          spec = json.load(open('arms/2026-11-26_package.json'))
+          assert all(re.fullmatch(r'[A-Za-z0-9_-]+', a['name']) for a in spec['arms'])
+          assert all(k.startswith('K3_') for a in spec['arms'] for k in a['env'])
+          total = sum(a['timeout_sec'] for a in spec['arms']); assert total <= 8 * 3600, total
+          print('arms', [a['name'] for a in spec['arms']], 'total timeout h', round(total / 3600, 2))
+          PY
+      - name: Multi-arm driver isolation (one arm fails on purpose; others must complete)
+        env:
+          K3_SEQ: 16
+          K3_BATCH: 1
+        run: |
+          python colab_run.py --profile staged --script staged_transfer.py --no-venv --arms arms/smoke_driver_check.json --run-root .qa_ci_arms --seq 16
+          python - <<'PY'
+          import json, glob
+          run = glob.glob('.qa_ci_arms/*/status.json')[0].rsplit('/', 1)[0]
+          st = json.load(open(run + '/status.json'))
+          states = {a['name']: a['state'] for a in st['arms']}
+          print(st['state'], states, 'resets', st['resets'])
+          assert st['state'] == 'COMPLETED_WITH_FAILED_ARMS'
+          want = {n: 'COMPLETED' for n in ('ok_default', 'dirty_once', 'lmhead_budget', 'aki_lam0', 'ok_control')}
+          want['must_fail'] = 'FAILED'
+          assert states == want, states
+          dirty = next(a for a in st['arms'] if a['name'] == 'dirty_once')
+          assert dirty['attempts'] == 2, dirty
+          resets = json.load(open(run + '/memory_resets.json'))
+          assert 1 <= len(resets) <= 3, len(resets)
+          assert any('accelerator memory occupied' in r for e in resets for r in e['reasons']) or len(resets) == 3, resets
+          assert any(r.startswith('host_ram_used') for e in resets for r in e['reasons'])
+          rows = open(run + '/memory_monitor.jsonl').read().splitlines()
+          assert rows and json.loads(rows[-1])['host']['used_pct'] > 0
+          rep = json.load(open(run + '/artifacts/lmhead_budget/report.json'))
+          assert rep['stages']['S3_warmup']['status'] == 'STOPPED_TIME_BUDGET', rep['stages']['S3_warmup']['status']
+          assert rep['hbm_start'] is not None and 'S2_diag' in rep
+          PY

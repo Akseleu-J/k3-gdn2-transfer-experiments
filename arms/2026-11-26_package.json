@@ -1,0 +1,40 @@
+{
+  "package": "2026-11-26 multi-hypothesis package (~7.2 h on TPU v5e-8, kernel limit 8 h)",
+  "context": "Runs 144735/082324/102849 used a model whose mixer outputs never reached the residual stream (revision 2 dropped `x = x + d`; fixed + regression test). Run 102849 also produced NaN grown logits at S2 (cause unlocalized). Every arm now writes S2_diag (per-sublayer magnitudes, first non-finite site, fp32 re-run).",
+  "total_budget_sec": 27000,
+  "memory_guard": {"sample_sec": 15, "host_used_reset_pct": 40, "host_used_kill_pct": 95, "kill_samples": 3, "disk_used_reset_pct": 85, "hbm_dirty_frac": 0.10, "max_resets": 3, "settle_sec": 15},
+  "common": "All arms: K3_STAGED_RUN=real, gate bypass allowed and recorded (data over stop), checkpoints keep only leaves <= 64 MB, held-out CE logged periodically. Arms are isolated processes: a failed arm is recorded and later arms still run.",
+  "hypotheses": {
+    "H1": "The missing mixer residual caused CE(0)=13.7 (> ln V). Expect CE(0) of fix_base far below 13.7, ideally below unigram.",
+    "H2": "The S2 NaN came from out-of-distribution inputs to duplicated early layers (0*inf in a copy). fix_base S2_diag localizes it; aki (copies = next teacher layers, in-distribution) should be finite if H2 holds.",
+    "H3": "With mixers restored, a trainable lm_head still helps (fix_lmhead vs fix_base, same steps).",
+    "H4": "The CKA penalty reduces copy/source redundancy at <= 0.02 nat CE cost (fix_base vs lam0).",
+    "H5": "Growth beats continuing the 8-layer base for the same number of optimizer steps (fix_base vs control_8L; step-matched, not FLOP-matched)."
+  },
+  "arms": [
+    {"name": "fix_base", "timeout_sec": 3600,
+     "note": "H1/H2 primary: fixed residual, lm_head frozen, stacking copies of base blocks. First arm also pays venv + teacher fetch (cached for later arms).",
+     "env": {"K3_STAGED_RUN": "real", "K3_S1_STEPS": 300, "K3_S3_STEPS": 900, "K3_S1_TRAINABLE": "new", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_LAMBDA_ORTH": 0.01, "K3_EVAL_EVERY": 150, "K3_STAGE_MAX_SEC": 1500, "K3_CKPT_MAX_LEAF_MB": 64}},
+    {"name": "fix_lmhead", "timeout_sec": 2700,
+     "note": "H3: as fix_base + lm_head trainable in S1.",
+     "env": {"K3_STAGED_RUN": "real", "K3_S1_STEPS": 300, "K3_S3_STEPS": 900, "K3_S1_TRAINABLE": "new_lm_head", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_LAMBDA_ORTH": 0.01, "K3_EVAL_EVERY": 150, "K3_STAGE_MAX_SEC": 1500, "K3_CKPT_MAX_LEAF_MB": 64}},
+    {"name": "aki", "timeout_sec": 3000,
+     "note": "H2: copies take mixers of teacher layers 8-15 (bert2BERT AKI) instead of duplicating base blocks; otherwise as fix_base.",
+     "env": {"K3_STAGED_RUN": "real", "K3_S1_STEPS": 300, "K3_S3_STEPS": 900, "K3_S1_TRAINABLE": "new", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_COPY_SOURCE": "teacher", "K3_LAMBDA_ORTH": 0.01, "K3_EVAL_EVERY": 150, "K3_STAGE_MAX_SEC": 1500, "K3_CKPT_MAX_LEAF_MB": 64}},
+    {"name": "lam0", "timeout_sec": 2700,
+     "note": "H4: as fix_base with the CKA penalty off (CKA still logged).",
+     "env": {"K3_STAGED_RUN": "real", "K3_S1_STEPS": 300, "K3_S3_STEPS": 900, "K3_S1_TRAINABLE": "new", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_LAMBDA_ORTH": 0, "K3_EVAL_EVERY": 150, "K3_STAGE_MAX_SEC": 1500, "K3_CKPT_MAX_LEAF_MB": 64}},
+    {"name": "control_8L", "timeout_sec": 1800,
+     "note": "H5: no growth; the 8-layer base trains for 1200 steps (= S1 300 + S3 900 of fix_base).",
+     "env": {"K3_STAGED_RUN": "real", "K3_TARGET": 8, "K3_S1_STEPS": 1200, "K3_S1_TRAINABLE": "new", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_EVAL_EVERY": 150, "K3_STAGE_MAX_SEC": 1200, "K3_CKPT_MAX_LEAF_MB": 64}},
+    {"name": "long", "timeout_sec": 12000,
+     "note": "Long run (last, so a session limit only truncates it): lm_head trainable, S1 600, S3 up to 6000 steps with a graceful 150-min stage budget.",
+     "env": {"K3_STAGED_RUN": "real", "K3_S1_STEPS": 600, "K3_S3_STEPS": 6000, "K3_S1_TRAINABLE": "new_lm_head", "K3_ALLOW_HIGH_CE0": 1,
+             "K3_LAMBDA_ORTH": 0.01, "K3_EVAL_EVERY": 500, "K3_STAGE_MAX_SEC": 9000, "K3_CKPT_MAX_LEAF_MB": 64}}
+  ]
+}

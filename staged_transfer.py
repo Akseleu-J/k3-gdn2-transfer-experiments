@@ -46,6 +46,14 @@ BATCH_REQUESTED = int(os.environ.get('K3_BATCH', 0))
 SEED = int(os.environ.get('K3_SEED', 0))
 S1_TRAINABLE = os.environ.get('K3_S1_TRAINABLE', 'new')  # 'new' or 'new_lm_head' (diagnostic arm A+B)
 ALLOW_HIGH_CE0 = os.environ.get('K3_ALLOW_HIGH_CE0', '0') == '1'  # preregistered gate bypass
+COPY_SOURCE = os.environ.get('K3_COPY_SOURCE', 'base')   # 'base': duplicate trained base blocks; 'teacher': next teacher layers (bert2BERT AKI)
+EVAL_EVERY = int(os.environ.get('K3_EVAL_EVERY', 0))       # held-out CE every N steps (0 = off)
+STAGE_MAX_SEC = float(os.environ.get('K3_STAGE_MAX_SEC', 0))   # graceful per-stage wall-clock budget (0 = off)
+CKPT_MAX_LEAF_MB = float(os.environ.get('K3_CKPT_MAX_LEAF_MB', 0))   # skip checkpoint leaves above this size (0 = keep all)
+ARM_DEADLINE_SEC = float(os.environ.get('K3_ARM_DEADLINE_SEC', 0))    # whole-process soft deadline set by the driver
+HBM_DIRTY_FRAC = float(os.environ.get('K3_HBM_DIRTY_FRAC', 0.10))
+PROC_T0 = time.monotonic()
+assert COPY_SOURCE in ('base', 'teacher'), COPY_SOURCE
 ARTIFACTS = os.environ.get('K3_ARTIFACTS', 'artifacts')
 os.makedirs(ARTIFACTS, exist_ok=True)
 REPORT = {'run': RUN, 'revision': '2-audit-2026-11-19', 'status': 'RUNNING', 'results': [],
@@ -70,6 +78,7 @@ def exception_hook(typ, value, tb):
 sys.excepthook = exception_hook
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staged_core
+import mem_guard
 from staged_core import cka_penalty, build_growth_plan
 
 HIGHEST = jax.lax.Precision.HIGHEST
@@ -108,6 +117,18 @@ REPORT['packages'] = {k: importlib.metadata.version(k) for k in ['jax', 'jaxlib'
 save_rpt()
 HF_TOKEN = os.environ.get('HF_TOKEN')
 K3_SHA = None
+# Memory guard: refuse to start on an occupied accelerator (the driver resets and retries),
+# then sample allocator statistics passively for the whole process.
+REPORT['hbm_start'] = mem_guard.hbm_stats(jax.local_devices())
+_dirty = mem_guard.hbm_dirty(REPORT['hbm_start'], HBM_DIRTY_FRAC)
+_fake = os.environ.get('K3_TEST_DIRTY_ONCE', '') if RUN == 'smoke' else ''   # test hook, smoke only
+if _fake and not os.path.exists(_fake):
+    Path(_fake).write_text('x'); _dirty = [0]
+if _dirty:
+    REPORT['status'] = 'HBM_DIRTY'; REPORT['hbm_dirty_devices'] = _dirty; save_rpt()
+    print('[mem-guard] accelerator memory occupied at start on devices', _dirty, flush=True)
+    sys.exit(mem_guard.HBM_DIRTY_EXIT)
+mem_guard.start_hbm_monitor(jax.local_devices(), os.path.join(ARTIFACTS, 'hbm_monitor.jsonl'))
 
 # ----------------------------- model (staged variant, rev 2) -----------------------------
 # Math identical to the reviewed experiment.py; deltas: mixers/FFN additionally
@@ -155,6 +176,20 @@ class DeltaAttentionResidual(nn.Module):
         return (a * retrieved).astype(cur.dtype)
 
 
+def _amax(t):
+    return jnp.max(jnp.abs(jnp.asarray(t).astype(jnp.float32)))      # NaN-propagating
+
+
+DIAG_FIELDS = ('x_in', 'dar', 'normed_in', 'rep', 'delta', 'inner', 'nonfinite_rep', 'nonfinite_delta')
+
+
+def _diag_row(x, dar, nx, rep, delta, inner):
+    """Per-sublayer magnitudes for localizing non-finite values (S2 diagnostics):
+    inner = max|S| of the GDN state / max|scores| of MLA; FFN row has dar=inner=0."""
+    nf = lambda t: jnp.sum(~jnp.isfinite(jnp.asarray(t).astype(jnp.float32))).astype(jnp.float32)
+    return jnp.stack([_amax(x), _amax(dar), _amax(nx), _amax(rep), _amax(delta), jnp.asarray(inner, jnp.float32), nf(rep), nf(delta)])
+
+
 class GDN2Mixer(nn.Module):
     cfg: StudentConfig
     @nn.compact
@@ -181,16 +216,18 @@ class GDN2Mixer(nn.Module):
         log_decay = -5.0 * jax.nn.sigmoid(jnp.exp(decay_a)[None, None, :, None] * raw_gate)
         out_gate = D("out_gate", Pp)(x)
         S0 = jnp.zeros((B, H, Dh, Dh), jnp.float32)
-        def step(S, xs):
+        def step(carry, xs):
+            S, smax = carry
             q_t, k_t, v_t, e_t, w_t, g_t = xs
             S = S * jnp.exp(g_t)[..., None, :]
             Sk = jnp.einsum("bhij,bhj->bhi", S, e_t * k_t)
             S = S + jnp.einsum("bhi,bhj->bhij", w_t * v_t - Sk, k_t)
-            return S, jnp.einsum("bhij,bhj->bhi", S, q_t)
+            smax = jnp.maximum(smax, jnp.max(jnp.abs(S)))   # NaN-propagating state magnitude (diagnostics)
+            return (S, smax), jnp.einsum("bhij,bhj->bhi", S, q_t)
         xs = jax.tree.map(lambda t: jnp.swapaxes(t.astype(jnp.float32), 1, 0), (q, k, v, erase, write, log_decay))
-        _, o = jax.lax.scan(jax.checkpoint(step), S0, xs); o = jnp.swapaxes(o, 0, 1).reshape(B, L, Pp)
+        (_, smax), o = jax.lax.scan(jax.checkpoint(step), (S0, jnp.zeros((), jnp.float32)), xs); o = jnp.swapaxes(o, 0, 1).reshape(B, L, Pp)
         rep = nn.RMSNorm(epsilon=1e-5, param_dtype=jnp.bfloat16, name="o_norm")(o.reshape(B, L, H, Dh)).reshape(B, L, Pp) * jax.nn.sigmoid(out_gate)
-        return nn.Dense(cfg.d_model, use_bias=False, name="o_proj", **BF)(rep), rep
+        return nn.Dense(cfg.d_model, use_bias=False, name="o_proj", **BF)(rep), rep, jnp.maximum(smax, _amax(o))
 
 
 class MLAMixer(nn.Module):
@@ -210,7 +247,7 @@ class MLAMixer(nn.Module):
         att = jax.nn.softmax(jnp.where(jnp.tril(jnp.ones((L, L), bool))[None, None], scores, -1e30), -1)
         o = jnp.einsum("bhlm,bmhd->blhd", att, v.astype(jnp.float32)).reshape(B, L, H * D)
         rep = o * jax.nn.sigmoid(dense("g_proj", H * D)(x))
-        return dense("o_proj", cfg.d_model)(rep), rep
+        return dense("o_proj", cfg.d_model)(rep), rep, _amax(scores)
 
 
 class FFNSublayer(nn.Module):
@@ -233,27 +270,30 @@ class DARLayer(nn.Module):
         x1 = x + dar
         nx = nn.RMSNorm(epsilon=1e-6, param_dtype=jnp.bfloat16, name="pre_sublayer_norm")(x1)
         if self.layer_idx in self.cfg.mla_positions:
-            d, mrep = MLAMixer(cfg=self.cfg, name="mixer")(nx, cos, sin)
+            d, mrep, inner = MLAMixer(cfg=self.cfg, name="mixer")(nx, cos, sin)
         else:
-            d, mrep = GDN2Mixer(cfg=self.cfg, name="mixer")(nx)
-        return x1, d, mrep
+            d, mrep, inner = GDN2Mixer(cfg=self.cfg, name="mixer")(nx)
+        diag = _diag_row(x, dar, nx, mrep, d, inner)
+        return x1, d, mrep, diag
 
 
 class DARBlock(nn.Module):
     cfg: StudentConfig; block_idx: int; layer_idx_start: int
     @nn.compact
     def __call__(self, x, history, cos, sin):
-        ld = []; mreps = []
+        ld = []; mreps = []; diags = []
         for i in range(self.cfg.layers_per_block):
             idx = self.layer_idx_start + i
-            x, d, mrep = DARLayer(cfg=self.cfg, layer_idx=idx, name=f"layer_{idx}")(x, ld, history, cos, sin)
-            ld.append(d); mreps.append(mrep)
+            x, d, mrep, dg = DARLayer(cfg=self.cfg, layer_idx=idx, name=f"layer_{idx}")(x, ld, history, cos, sin)
+            ld.append(d); mreps.append(mrep); diags.append(dg)
+            x = x + d
         nh = jnp.concatenate([history, sum(ld)[None]], 0)
         nx = nn.RMSNorm(epsilon=1e-6, param_dtype=jnp.bfloat16, name="pre_ffn_norm")(x)
         f, frep = FFNSublayer(cfg=self.cfg, name="ffn")(nx)
+        diags.append(_diag_row(x, jnp.zeros((), jnp.float32), nx, frep, f, jnp.zeros((), jnp.float32)))
         x = x + f
         mixer_rep = jnp.sum(jnp.stack(mreps, 0), 0)      # F_b^{mix} = sum of layer contributions
-        return x, nh, mixer_rep, frep
+        return x, nh, mixer_rep, frep, jnp.stack(diags, 0)
 
 
 class StudentLM(nn.Module):
@@ -263,15 +303,16 @@ class StudentLM(nn.Module):
         B, L = ids.shape
         embed = nn.Embed(self.cfg.vocab, self.cfg.d_model, name="embed", **BF)
         x = embed(ids); cos, sin = RoPE(self.cfg.qk_rope_head_dim, self.cfg.rope_theta)(L)
-        hist = jnp.zeros((0, B, L, self.cfg.d_model), dtype=x.dtype); RB = nn.remat(DARBlock); mrs = []; frs = []
+        hist = jnp.zeros((0, B, L, self.cfg.d_model), dtype=x.dtype); RB = nn.remat(DARBlock); mrs = []; frs = []; dgs = []
         for bi in range(self.cfg.num_blocks):
-            x, hist, mr, fr = RB(cfg=self.cfg, block_idx=bi, layer_idx_start=bi * self.cfg.layers_per_block, name=f"block_{bi}")(x, hist, cos, sin)
-            mrs.append(mr); frs.append(fr)
+            x, hist, mr, fr, dg = RB(cfg=self.cfg, block_idx=bi, layer_idx_start=bi * self.cfg.layers_per_block, name=f"block_{bi}")(x, hist, cos, sin)
+            mrs.append(mr); frs.append(fr); dgs.append(dg)
         x = nn.RMSNorm(epsilon=1e-6, param_dtype=jnp.bfloat16, name="final_norm")(x)
         logits = embed.attend(x) if self.cfg.tie_embeddings else nn.Dense(self.cfg.vocab, use_bias=False, name="lm_head", **BF)(x)
         if not collect_blocks:
             return logits
-        return logits, {'mixer': jnp.stack(mrs, 0), 'ffn': jnp.stack(frs, 0)}
+        return logits, {'mixer': jnp.stack(mrs, 0), 'ffn': jnp.stack(frs, 0), 'diag': jnp.stack(dgs, 0),
+                        'final_absmax': _amax(x)}
 
 
 # ----------------------------- report/optimizer helpers -----------------------------
@@ -321,9 +362,11 @@ def data_key(stage_tag, step):
     return jax.random.fold_in(jax.random.PRNGKey(SEED), stage_tag * 10 ** 6 + step)
 
 
-def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, collect_gram, extra=None):
-    """Shared training loop; returns (tr, final_op, report_dict)."""
-    rep = {'steps_planned': steps}; t0 = time.monotonic(); last = {}
+def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, collect_gram, extra=None, eval_fn=None):
+    """Shared training loop; returns (tr, final_op, report_dict). Optional periodic
+    held-out CE (eval_fn, every EVAL_EVERY steps) and a graceful wall-clock budget."""
+    rep = {'steps_planned': steps}; t0 = time.monotonic(); last = {}; stopped = False
+    mpath = Path(ARTIFACTS, f'{report_key}_metrics.jsonl')
     if extra: rep.update(extra)
     if steps:
         @jax.jit
@@ -354,13 +397,30 @@ def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, col
                     off = gm[~np.eye(n, dtype=bool)]
                     row[f'{name}_cka_mean'] = float(off.mean()); row[f'{name}_cka_max'] = float(off.max())
                     if step % 100 == 1 or step == steps: row[f'{name}_gram'] = gm.round(4).tolist()
-            rep.setdefault('metrics', []).append({k: v for k, v in row.items() if not k.endswith('_gram')})
-            REPORT['last_step'] = {k: v for k, v in row.items() if not k.endswith('_gram')}; save_rpt()
-            print(f'[{tag}]', {k: (round(v, 6) if isinstance(v, float) else v) for k, v in row.items() if not k.endswith('_gram')}, flush=True)
+            if eval_fn is not None and EVAL_EVERY and (step % EVAL_EVERY == 0 or step == steps):
+                row['ce_val'] = eval_fn(tr)
+            slim = {k: v for k, v in row.items() if not k.endswith('_gram')}
+            rep.setdefault('metrics', []).append(slim)
+            with mpath.open('a', encoding='utf-8') as mf: mf.write(json.dumps(row) + chr(10))
+            REPORT['last_step'] = slim
+            if step % 10 == 0 or step == steps or 'ce_val' in row or not row['accepted']: save_rpt()
+            print(f'[{tag}]', {k: (round(v, 6) if isinstance(v, float) else v) for k, v in slim.items()}, flush=True)
             if not row['accepted']:
-                rep['status'] = 'FAILED_NONFINITE'; raise FloatingPointError(f'{tag}: nonfinite training step; update skipped')
+                rep['status'] = 'FAILED_NONFINITE'; REPORT['stages'][report_key] = rep; save_rpt()
+                raise FloatingPointError(f'{tag}: nonfinite training step; update skipped')
             last = row
-    rep['status'] = 'COMPLETED'; rep['elapsed_seconds'] = time.monotonic() - t0
+            over_stage = STAGE_MAX_SEC and time.monotonic() - t0 > STAGE_MAX_SEC
+            over_arm = ARM_DEADLINE_SEC and time.monotonic() - PROC_T0 > ARM_DEADLINE_SEC
+            if (over_stage or over_arm) and step < steps:
+                stopped = True; rep['stopped_at_step'] = step
+                if eval_fn is not None and 'ce_val' not in row: last['ce_val'] = eval_fn(tr)
+                rep['stop_reason'] = 'arm_deadline' if over_arm else 'stage_budget'
+                print(f"[{tag}] wall-clock {rep['stop_reason']} reached at step {step}; stopping stage gracefully", flush=True)
+                break
+    rep['status'] = 'STOPPED_TIME_BUDGET' if stopped else 'COMPLETED'; rep['elapsed_seconds'] = time.monotonic() - t0
+    rep['hbm'] = mem_guard.hbm_stats(jax.local_devices())
+    if len(rep.get('metrics', [])) > 2000:   # keep report.json bounded; full trace is in *_metrics.jsonl
+        m = rep['metrics']; rep['metrics'] = m[:500] + m[-1500:]; rep['metrics_truncated'] = {'kept': 2000, 'total': len(m), 'full': mpath.name}
     if last: rep['last'] = last
     REPORT['stages'][report_key] = rep; save_rpt()
     return tr, op, rep
@@ -368,12 +428,44 @@ def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, col
 
 def save_trainable(tag, tr):
     flat = {k: np.asarray(v) for k, v in flatten_dict(jax.device_get(tr), sep='/').items()}
+    skipped = []
+    if CKPT_MAX_LEAF_MB:
+        skipped = sorted(k for k, v in flat.items() if v.nbytes > CKPT_MAX_LEAF_MB * 2 ** 20)
+        flat = {k: v for k, v in flat.items() if k not in skipped}
     path = Path(ARTIFACTS, f'{tag}_trainable.npz'); temp = path.with_suffix('.tmp')
     with open(temp, 'wb') as f: np.savez(f, **flat)
     os.replace(temp, path)
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    REPORT['stages'][tag]['checkpoint'] = {'file': path.name, 'sha256': sha, 'kind': 'trainable-only', 'exact_resume': False}
+    REPORT['stages'][tag]['checkpoint'] = {'file': path.name, 'sha256': sha, 'kind': 'trainable-only', 'exact_resume': False,
+                                           'skipped_large_leaves': skipped}
     save_rpt(); print(f'[checkpoint] {path.name} sha256={sha[:16]}', flush=True)
+
+
+def s2_diag_report(db, dg, copy_blocks, base_logits, grown_logits, grown_logits_fp32, final_absmax):
+    """Readable S2 localization: rows = sublayers (layers + 'ffn') per block."""
+    def rows(d):
+        out = []
+        for b in range(d.shape[0]):
+            for r in range(d.shape[1]):
+                out.append(dict(block=b, sub=('ffn' if r == d.shape[1] - 1 else f'layer_{b * (d.shape[1] - 1) + r}'),
+                                **{f: (float(d[b, r, i]) if np.isfinite(d[b, r, i]) else str(d[b, r, i])) for i, f in enumerate(DIAG_FIELDS)}))
+        return out
+    def first_bad(d):
+        for b in range(d.shape[0]):
+            for r in range(d.shape[1]):
+                for i, f in enumerate(DIAG_FIELDS):
+                    v = d[b, r, i]
+                    if not np.isfinite(v) or (f.startswith('nonfinite') and v > 0):
+                        return dict(block=b, row=r, field=f, value=str(v))
+        return None
+    nf = lambda a: int(np.sum(~np.isfinite(a)))
+    summary = dict(base_first_nonfinite=first_bad(db), grown_first_nonfinite=first_bad(dg),
+                   nonfinite_logits=dict(base=nf(base_logits), grown_bf16=nf(grown_logits), grown_fp32=nf(grown_logits_fp32)),
+                   fp32_grown_vs_base_maxdiff=float(np.nanmax(np.abs(grown_logits_fp32 - base_logits))) if nf(grown_logits_fp32) == 0 else None,
+                   final_absmax=dict(base=final_absmax[0], grown=final_absmax[1]),
+                   max_inner_by_block_grown=[float(np.nanmax(dg[b, :, DIAG_FIELDS.index('inner')])) if np.isfinite(dg[b, :, DIAG_FIELDS.index('inner')]).all() else 'nonfinite' for b in range(dg.shape[0])],
+                   copies=list(copy_blocks))
+    return dict(summary=summary, fields=list(DIAG_FIELDS), base=rows(db), grown=rows(dg))
 
 
 def transplant_params(h1, gflat, plan, n_base, layers_per_block, copy_ffn):
@@ -700,10 +792,18 @@ def run_pipeline():
         REPORT['S1_reference']['gate_bypassed'] = True
         REPORT['S1_reference']['gate_bypass_note'] = 'preregistered diagnostic arm A+B (AUDIT_RUNS_2026-11-21); no quality claim from this run'
         save_rpt(); print('[gate] CE(0) stop bypassed by preregistered diagnostic flag; no quality claim', flush=True)
-    tr1, op1, rep1 = run_stage('S1', base_model, tr1, fr1, tx1, op1, S1_STEPS, train_ids, 'S1_base', 1, collect_gram=False, extra={'ce0_val': ce0})
+    tr1, op1, rep1 = run_stage('S1', base_model, tr1, fr1, tx1, op1, S1_STEPS, train_ids, 'S1_base', 1, collect_gram=False,
+                               extra={'ce0_val': ce0}, eval_fn=lambda t: eval_ce(base_model, t, fr1, val_ids))
     if S1_STEPS: save_trainable('S1_base', tr1)
-    chk('S1', 'completed', rep1['status'] == 'COMPLETED', rep1.get('last', {}).get('ce'))
+    chk('S1', 'completed', rep1['status'] in ('COMPLETED', 'STOPPED_TIME_BUDGET'), f"{rep1['status']} ce={rep1.get('last', {}).get('ce')}")
     REPORT['stages']['S1_base']['ce_val_end'] = eval_ce(base_model, tr1, fr1, val_ids); save_rpt()
+
+    if TARGET == N_BASE:   # compute-matched control arm: no growth, S1 only
+        for k in ('S3_warmup', 'S4_full'):
+            REPORT['stages'][k] = {'status': 'SKIPPED_CONTROL', 'note': 'K3_TARGET == K3_N_BASE: no-growth control arm'}
+        REPORT['status'] = 'COMPLETED'; save_rpt()
+        print(json.dumps({'status': 'COMPLETED', 'control_no_growth': True, 'ce_val_end': REPORT['stages']['S1_base']['ce_val_end']}), flush=True)
+        return
 
     # ----------------------------- S2: growth -----------------------------
     if RUN == 'real':
@@ -753,6 +853,32 @@ def run_pipeline():
         del t2; gc.collect()
 
     new_flat = transplant_params(h1, gflat, plan, N_BASE, base_cfg.layers_per_block, copy_ffn)
+    REPORT['copy_source'] = COPY_SOURCE
+    if COPY_SOURCE == 'teacher' and RUN == 'real':
+        # bert2BERT-AKI arm: copy blocks take the mixers of the NEXT teacher layers
+        # (N_BASE..TARGET-1) instead of duplicating base blocks; DAR/norm scales still
+        # come from the S1 source block, outputs (o_proj, down_proj, DAR scale) stay 0.
+        aki_layers = list(range(N_BASE, TARGET))
+        need3 = [f'language_model.model.layers.{L}.{s}' for L in aki_layers for s in (MLA_SUF if L in grown_cfg.mla_positions else KDA_SUF)]
+        miss3 = [n for n in need3 if n not in wm]
+        if miss3: raise KeyError(f'Missing AKI teacher tensors: {miss3[:4]}')
+        tensors = fetch_tensors(need3, wm)
+        replaced = 0
+        for L in aki_layers:
+            for k, v in (_mla if L in grown_cfg.mla_positions else _kda)(L, H_s, Dh).items():
+                key = f'block_{L // base_cfg.layers_per_block}/layer_{L}/{k}'
+                if key.endswith('/mixer/o_proj/kernel'): continue          # stays exactly zero (identity at growth)
+                if key not in new_flat: raise KeyError(f'AKI leaf not in grown tree: {key}')
+                tgt = new_flat[key]; a = np.asarray(v)
+                if a.shape != tgt.shape:
+                    if a.T.shape == tgt.shape: a = a.T
+                    elif a.ndim == 1 and tgt.ndim == 1 and tgt.shape[0] % a.shape[0] == 0: a = np.tile(a, tgt.shape[0] // a.shape[0])
+                    else: raise ValueError(f'{key}: AKI patch {a.shape} != {tgt.shape}')
+                new_flat[key] = a.astype(tgt.dtype, copy=False); replaced += 1
+        del tensors; gc.collect()
+        REPORT['S2_aki'] = {'teacher_layers': aki_layers, 'replaced_leaves': replaced}; save_rpt()
+    elif COPY_SOURCE == 'teacher':
+        REPORT['S2_aki'] = {'note': 'smoke: no teacher; COPY_SOURCE=teacher falls back to base duplication'}
     params_grown = jax.device_put(unflatten_dict(new_flat, sep='/'), sharded_like(grown_abstract))
     REPORT['S2_transplant'] = {'leaves': len(new_flat), 'copies': copy_block_ids,
                                'zero_init': ['mixer/o_proj', 'ffn/down_proj', 'dar/alpha_scale (copies)']}; save_rpt()
@@ -778,7 +904,21 @@ def run_pipeline():
                    and (k.endswith('/mixer/o_proj/kernel') or k.endswith('/ffn/down_proj/kernel') or k.endswith('/dar/alpha_scale'))]
     chk('S2', 'copy_outputs_exactly_zero', len(zero_leaves) > 0 and all(not np.any(np.asarray(new_flat[k])) for k in zero_leaves),
         f'{len(zero_leaves)} zero-init leaves')
-    lmax = float(np.abs(np.asarray(lb)).max())
+    # Localization diagnostics (run 2026-11-26 failed here with NaN grown logits): per
+    # block/sublayer magnitudes for base and grown, first non-finite site, and a fp32
+    # re-run of the grown forward (separates bf16 overflow from genuine instability).
+    @jax.jit
+    def _diag_base(a, b, batch): return base_model.apply({'params': merge(a, b)}, batch, collect_blocks=True)[1]
+    @jax.jit
+    def _diag_grown(a, b, batch): return grown_model.apply({'params': merge(a, b)}, batch, collect_blocks=True)[1]
+    db = jax.device_get(_diag_base(tr1, fr1, probe)); dg = jax.device_get(_diag_grown(params_grown, {}, probe))
+    g32 = jax.tree.map(lambda v: v.astype(jnp.float32) if jnp.issubdtype(v.dtype, jnp.floating) else v, params_grown)
+    lg32 = np.asarray(_logits_grown(g32, {}, probe).astype(jnp.float32)); del g32
+    REPORT['S2_diag'] = s2_diag_report(np.asarray(db['diag']), np.asarray(dg['diag']), copy_block_ids,
+                                       base_logits=np.asarray(lb), grown_logits=np.asarray(lg), grown_logits_fp32=lg32,
+                                       final_absmax=(float(db['final_absmax']), float(dg['final_absmax'])))
+    save_rpt(); print('[S2 diag]', json.dumps(REPORT['S2_diag']['summary']), flush=True)
+    lmax = float(np.nanmax(np.abs(np.asarray(lb)))) if np.isfinite(np.asarray(lb)).any() else 1.0
     tol = 4.0 * 2.0 ** (math.floor(math.log2(max(lmax, 1e-30))) - 7)   # 4 bf16 ulps at max|logit|
     chk('S2', 'function_preservation_numeric', maxdiff <= tol and kl <= 1e-4,
         f'max_abs_diff={maxdiff:.2e} tol={tol:.2e} kl={kl:.2e} bitwise={bitwise}')
@@ -792,7 +932,8 @@ def run_pipeline():
     del params_grown, pg, new_flat
     gc.collect()
     tx3 = make_tx(tr3); op3 = tx3.init(tr3)
-    tr3, op3, rep3 = run_stage('S3', grown_model, tr3, fr3, tx3, op3, S3_STEPS, train_ids, 'S3_warmup', 3, collect_gram=True)
+    tr3, op3, rep3 = run_stage('S3', grown_model, tr3, fr3, tx3, op3, S3_STEPS, train_ids, 'S3_warmup', 3, collect_gram=True,
+                               eval_fn=lambda t: eval_ce(grown_model, t, fr3, val_ids))
     if S3_STEPS: save_trainable('S3_warmup', tr3)
     zg = flatten_dict(jax.device_get(merge(tr3, fr3)), sep='/')
     zero_norms = {k: float(np.linalg.norm(np.asarray(v))) for k, v in zg.items()
