@@ -138,4 +138,26 @@ check('diag_report_no_false_alarm', rep_['summary']['grown_first_nonfinite'] is 
 bad = np.asarray(rb['diag']).copy(); bad[2, 1, 5] = np.inf
 check('diag_report_localizes_inf', st.s2_diag_report(bad, bad, [2, 3], l0, l0, l0, (1.0, 1.0))['summary']['grown_first_nonfinite']['block'] == 2)
 
+# (vi) M-001 v2: held-out CE must not depend on the micro-batch size
+val = np.random.default_rng(9).integers(0, 64, size=400).astype(np.int32)
+m1, d1 = st.heldout_ce(base_model, params_base, {}, val, n_windows=5, batch=1)
+m2, d2 = st.heldout_ce(base_model, params_base, {}, val, n_windows=5, batch=2)
+m5, d5 = st.heldout_ce(base_model, params_base, {}, val, n_windows=5, batch=4)
+check('eval_independent_of_batch', abs(m1 - m2) < 2e-3 and abs(m1 - m5) < 2e-3, f'{m1:.6f} {m2:.6f} {m5:.6f}')
+check('eval_same_windows_and_token_count', d1['starts_sha256'] == d2['starts_sha256'] == d5['starts_sha256'] and d1['tokens'] == 5 * st.SEQ == d5['tokens'])
+uni = st.unigram_ce(val, val, 64, n_windows=5)
+check('unigram_finite_and_below_lnV_plus', 0 < uni < np.log(64) + 0.5, f'{uni:.4f}')
+
+# (vii) M-009 on the real model trees: grown costs more than base, dense part counts every kernel once
+base_abs = jax.eval_shape(lambda r: base_model.init(r, ids_small)['params'], jax.random.PRNGKey(0))
+fb_, fg_ = st.flops_report(BASE, base_abs), st.flops_report(GROWN, grown_abstract)
+kernels = sum(2 * int(np.prod(v.shape)) for k, v in flatten_dict(base_abs, sep='/').items() if k.endswith('/kernel'))
+check('flops_dense_matches_kernels', fb_['dense'] == kernels, f'{fb_["dense"]:.0f}')
+check('flops_layers_detected', (fb_['gdn_layers'], fb_['mla_layers'], fg_['gdn_layers'], fg_['mla_layers']) == (6, 2, 12, 4))
+check('flops_grown_greater_than_base', fg_['total'] > fb_['total'])
+
+# (viii) direct-transfer baseline: S1 may train whole blocks, same set as S3 of the staged arm
+gm = trainable_mask(flat_grown, 'blocks', [2, 3])
+check('direct_mask_equals_staged_s3_mask', gm == mask)
+
 print(f'ALL {len(results)} STAGED-MODEL CHECKS PASS')

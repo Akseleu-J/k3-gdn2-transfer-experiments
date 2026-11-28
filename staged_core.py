@@ -55,6 +55,41 @@ def cka_penalty(reps, lam, pairs, n_tokens=512, key=0, eps=1e-6):
     return lam * jnp.sum(gram * pm) / count, gram
 
 
+def forward_flops(param_shapes, seq, n_heads, d_head, qk_rope_dim):
+    """M-009 v1: analytic forward FLOPs per token (multiply-add = 2) from parameter shapes.
+
+    Counted: every 2-D `kernel` (dense matmul, incl. lm_head), depthwise convolutions,
+    the GDN delta-rule state recurrence (7 * H * Dh^2: decay Dh^2, S@(e*k) 2Dh^2,
+    outer update 2Dh^2, read S@q 2Dh^2) and causal MLA attention averaged over a
+    sequence of length `seq` (scores 2H(D+R) and values 2HD per attended position).
+    Not counted: embedding lookup, norms, activations, softmax, depth routing
+    (O(sources * d)). Training cost is a multiple of this and is not claimed here.
+    """
+    dense = conv = state = attention = 0.0
+    gdn_layers, mla_layers = set(), set()
+    for key, shape in param_shapes.items():
+        if key.endswith('/kernel') and len(shape) == 2:
+            dense += 2.0 * shape[0] * shape[1]
+        elif key.endswith('_conv_w') and len(shape) == 2:
+            conv += 2.0 * shape[0] * shape[1]
+        if key.endswith('/mixer/erase_gate/kernel'):
+            gdn_layers.add(key.rsplit('/mixer/', 1)[0])
+        if key.endswith('/mixer/kv_b_proj/kernel'):
+            mla_layers.add(key.rsplit('/mixer/', 1)[0])
+    state = len(gdn_layers) * 7.0 * n_heads * d_head * d_head
+    mean_context = (seq + 1) / 2.0
+    attention = len(mla_layers) * mean_context * (2.0 * n_heads * (d_head + qk_rope_dim) + 2.0 * n_heads * d_head)
+    return dict(dense=dense, conv=conv, gdn_state=state, mla_attention=attention,
+                total=dense + conv + state + attention, gdn_layers=len(gdn_layers), mla_layers=len(mla_layers))
+
+
+def eval_window_starts(n_tokens, seq, n_windows):
+    """M-001 v2: evenly spaced held-out window starts; no RNG, no device-count dependence."""
+    last = n_tokens - seq - 1
+    assert last >= 0 and n_windows >= 1, 'held-out data shorter than one window'
+    return np.linspace(0, last, n_windows).astype(np.int64)
+
+
 def orthogonality_penalty(block_outputs, lam, scope='all', eps=1e-6):
     """DEPRECATED (audit 2026-11-19): penalizes accumulated residual-stream
     states, not block contributions; gradient w.r.t. zero gates is first-order

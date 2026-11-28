@@ -3,7 +3,10 @@ on: [push, workflow_dispatch]
 jobs:
   tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash .github/ci_shell.sh {0}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,17 +42,53 @@ jobs:
           K3_S1_TRAINABLE: new
           K3_ALLOW_HIGH_CE0: '0'
         run: python staged_transfer.py
+      - name: A/A measurement check, 1 vs 8 devices (INC-003; tolerance fixed in advance)
+        env:
+          K3_STAGED_RUN: smoke
+          K3_S1_STEPS: 2
+          K3_S3_STEPS: 2
+          K3_SEQ: 16
+          K3_BATCH: 8
+          K3_EVAL_WINDOWS: 16
+        run: |
+          K3_ARTIFACTS=.qa_aa_1 python staged_transfer.py
+          K3_ARTIFACTS=.qa_aa_8 XLA_FLAGS=--xla_force_host_platform_device_count=8 python staged_transfer.py
+          python - <<'PY'
+          import json
+          a, b = (json.load(open(f'.qa_aa_{n}/report.json')) for n in (1, 8))
+          assert (len(a['env']['devices']), len(b['env']['devices'])) == (1, 8)
+          ra, rb = a['S1_reference'], b['S1_reference']
+          assert ra['global_batch'] == rb['global_batch'] == 8
+          for k in ('windows', 'tokens', 'starts_sha256', 'ids_sha256'):
+              assert ra['ce0_detail'][k] == rb['ce0_detail'][k], k
+          assert ra['unigram_ce_val'] == rb['unigram_ce_val']
+          pairs = {'ce0': (ra['ce0_val'], rb['ce0_val']),
+                   'step1_train_ce': (a['stages']['S1_base']['metrics'][0]['ce'], b['stages']['S1_base']['metrics'][0]['ce']),
+                   's1_heldout': (a['stages']['S1_base']['ce_val_end'], b['stages']['S1_base']['ce_val_end']),
+                   's3_heldout': (a['stages']['S3_warmup']['ce_val_end'], b['stages']['S3_warmup']['ce_val_end'])}
+          diffs = {k: abs(x - y) for k, (x, y) in pairs.items()}
+          print('A/A abs differences (nat):', diffs)
+          assert all(v <= 5e-3 for v in diffs.values()), diffs
+          assert a['stages']['S1_base']['train_tokens'] == b['stages']['S1_base']['train_tokens'] == 2 * 8 * 16
+          assert a['flops'] == b['flops']
+          PY
       - name: Driver CLI sanity
         run: python colab_run.py --help > /dev/null
       - name: Package arms file is valid (names, K3_* env only, timeouts within 8 h)
         run: |
           python - <<'PY'
           import json, re
-          spec = json.load(open('arms/2026-11-26_package.json'))
-          assert all(re.fullmatch(r'[A-Za-z0-9_-]+', a['name']) for a in spec['arms'])
-          assert all(k.startswith('K3_') for a in spec['arms'] for k in a['env'])
-          total = sum(a['timeout_sec'] for a in spec['arms']); assert total <= 8 * 3600, total
-          print('arms', [a['name'] for a in spec['arms']], 'total timeout h', round(total / 3600, 2))
+          for path in ('arms/2026-11-26_package.json', 'arms/2026-11-29_method_v1.json'):
+              spec = json.load(open(path))
+              assert all(re.fullmatch(r'[A-Za-z0-9_-]+', a['name']) for a in spec['arms'])
+              assert all(k.startswith('K3_') for a in spec['arms'] for k in a['env'])
+              total = sum(a['timeout_sec'] for a in spec['arms']); assert total <= 8 * 3600, total
+              print(path, [a['name'] for a in spec['arms']], 'total timeout h', round(total / 3600, 2))
+          spec = json.load(open('arms/2026-11-29_method_v1.json'))
+          assert len({a['env']['K3_BATCH'] for a in spec['arms']}) == 1
+          assert len({a['env']['K3_EVAL_WINDOWS'] for a in spec['arms']}) == 1
+          budget = spec['preregistration']['budget']['train_flops']
+          assert max(budget.values()) / min(budget.values()) < 1.002, budget
           PY
       - name: Multi-arm driver isolation (one arm fails on purpose; others must complete)
         env:
@@ -64,7 +103,7 @@ jobs:
           states = {a['name']: a['state'] for a in st['arms']}
           print(st['state'], states, 'resets', st['resets'])
           assert st['state'] == 'COMPLETED_WITH_FAILED_ARMS'
-          want = {n: 'COMPLETED' for n in ('ok_default', 'dirty_once', 'lmhead_budget', 'aki_lam0', 'ok_control')}
+          want = {n: 'COMPLETED' for n in ('ok_default', 'dirty_once', 'lmhead_budget', 'aki_lam0', 'direct16', 'ok_control')}
           want['must_fail'] = 'FAILED'
           assert states == want, states
           dirty = next(a for a in st['arms'] if a['name'] == 'dirty_once')
@@ -79,3 +118,7 @@ jobs:
           assert rep['stages']['S3_warmup']['status'] == 'STOPPED_TIME_BUDGET', rep['stages']['S3_warmup']['status']
           assert rep['hbm_start'] is not None and 'S2_diag' in rep
           PY
+      - name: Publish failure tail as annotation
+        if: failure()
+        shell: bash
+        run: python .github/ci_annotate.py

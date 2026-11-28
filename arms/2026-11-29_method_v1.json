@@ -1,0 +1,232 @@
+{
+  "package": "method v1: staged growth vs FLOP-matched baselines (TPU v5e-8, 7.5 h budget; arms that no longer fit are skipped)",
+  "total_budget_sec": 27000,
+  "memory_guard": {
+    "sample_sec": 15,
+    "host_used_reset_pct": 40,
+    "host_used_kill_pct": 95,
+    "kill_samples": 3,
+    "disk_used_reset_pct": 85,
+    "hbm_dirty_frac": 0.1,
+    "max_resets": 3,
+    "settle_sec": 15
+  },
+  "preregistration": {
+    "primary_metric": "M-001.v2 held-out CE (256 windows x 128) at the end of the arm",
+    "budget": {
+      "measurement": "M-009.v1 forward FLOPs",
+      "seq": 128,
+      "global_batch": 8,
+      "flops_per_token_8L": 5736058880.0,
+      "flops_per_token_16L": 9123307520.0,
+      "train_flops": {
+        "staged": 1.0170157498368e+16,
+        "direct16": 1.017372865462272e+16,
+        "control8": 1.016741675139072e+16
+      }
+    },
+    "claim_rule": "staged is better than a baseline only if the paired difference has the same sign in all 3 seeds and its mean exceeds 2 x the standard deviation of the 3 paired differences; with fewer than 3 completed seeds report numbers, no claim",
+    "secondary": [
+      "CKA(copy, source) staged_s0 vs lam0_s0",
+      "S2 gates",
+      "CE vs FLOPs curve from the periodic evals"
+    ],
+    "stop": "a failed S2 gate or a non-finite step ends that arm; later arms still run"
+  },
+  "arms": [
+    {
+      "name": "staged_s0",
+      "timeout_sec": 2400,
+      "note": "method: S1 8 layers, growth to 16, S3 with CKA penalty",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 0,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 300,
+        "K3_S3_STEPS": 900,
+        "K3_LAMBDA_ORTH": 0.01
+      }
+    },
+    {
+      "name": "direct16_s0",
+      "timeout_sec": 3000,
+      "note": "baseline: 16 teacher layers at once, same trainable set as staged S3, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 0,
+        "K3_N_BASE": 16,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 1089,
+        "K3_S1_TRAIN_BLOCKS": "2,3",
+        "K3_BASE_FFN_LAYERS": "1,1,68,90"
+      }
+    },
+    {
+      "name": "control8_s0",
+      "timeout_sec": 1800,
+      "note": "baseline: no growth, 8 layers, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 0,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 8,
+        "K3_S1_STEPS": 1731
+      }
+    },
+    {
+      "name": "lam0_s0",
+      "timeout_sec": 2400,
+      "note": "ablation: method with the CKA penalty off",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 0,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 300,
+        "K3_S3_STEPS": 900,
+        "K3_LAMBDA_ORTH": 0
+      }
+    },
+    {
+      "name": "staged_s1",
+      "timeout_sec": 2400,
+      "note": "method: S1 8 layers, growth to 16, S3 with CKA penalty",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 1,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 300,
+        "K3_S3_STEPS": 900,
+        "K3_LAMBDA_ORTH": 0.01
+      }
+    },
+    {
+      "name": "direct16_s1",
+      "timeout_sec": 3000,
+      "note": "baseline: 16 teacher layers at once, same trainable set as staged S3, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 1,
+        "K3_N_BASE": 16,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 1089,
+        "K3_S1_TRAIN_BLOCKS": "2,3",
+        "K3_BASE_FFN_LAYERS": "1,1,68,90"
+      }
+    },
+    {
+      "name": "control8_s1",
+      "timeout_sec": 1800,
+      "note": "baseline: no growth, 8 layers, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 1,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 8,
+        "K3_S1_STEPS": 1731
+      }
+    },
+    {
+      "name": "staged_s2",
+      "timeout_sec": 2400,
+      "note": "method: S1 8 layers, growth to 16, S3 with CKA penalty",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 2,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 300,
+        "K3_S3_STEPS": 900,
+        "K3_LAMBDA_ORTH": 0.01
+      }
+    },
+    {
+      "name": "direct16_s2",
+      "timeout_sec": 3000,
+      "note": "baseline: 16 teacher layers at once, same trainable set as staged S3, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 2,
+        "K3_N_BASE": 16,
+        "K3_TARGET": 16,
+        "K3_S1_STEPS": 1089,
+        "K3_S1_TRAIN_BLOCKS": "2,3",
+        "K3_BASE_FFN_LAYERS": "1,1,68,90"
+      }
+    },
+    {
+      "name": "control8_s2",
+      "timeout_sec": 1800,
+      "note": "baseline: no growth, 8 layers, FLOP-matched",
+      "env": {
+        "K3_STAGED_RUN": "real",
+        "K3_BATCH": 8,
+        "K3_EVAL_WINDOWS": 256,
+        "K3_EVAL_EVERY": 150,
+        "K3_ALLOW_HIGH_CE0": 1,
+        "K3_S1_TRAINABLE": "new",
+        "K3_CKPT_MAX_LEAF_MB": 64,
+        "K3_SEED": 2,
+        "K3_N_BASE": 8,
+        "K3_TARGET": 8,
+        "K3_S1_STEPS": 1731
+      }
+    }
+  ]
+}

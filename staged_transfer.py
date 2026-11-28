@@ -79,14 +79,21 @@ sys.excepthook = exception_hook
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staged_core
 import mem_guard
-from staged_core import cka_penalty, build_growth_plan
+from staged_core import cka_penalty, build_growth_plan, forward_flops, eval_window_starts
 
 HIGHEST = jax.lax.Precision.HIGHEST
 devices = jax.devices(); N_DEV = len(devices)
 if RUN == 'real':
     if jax.default_backend() != 'tpu':
         raise RuntimeError('Staged real run requires a TPU backend; detected ' + jax.default_backend())
-BATCH = N_DEV if BATCH_REQUESTED == 0 else max(BATCH_REQUESTED, 1)
+# INC-003: the global batch never follows the device count (data order, token budget and
+# metrics must be identical on 1 and 8 devices).
+BATCH = BATCH_REQUESTED if BATCH_REQUESTED > 0 else (8 if RUN == 'real' else 1)
+if BATCH % N_DEV:
+    raise ValueError(f'K3_BATCH={BATCH} is not divisible by the device count {N_DEV}; set a global batch that is')
+EVAL_WINDOWS = int(os.environ.get('K3_EVAL_WINDOWS', 256 if RUN == 'real' else 8))
+S1_TRAIN_BLOCKS = [int(x) for x in os.environ.get('K3_S1_TRAIN_BLOCKS', '').split(',') if x.strip()]
+BASE_FFN_LAYERS = [int(x) for x in os.environ.get('K3_BASE_FFN_LAYERS', '1').split(',') if x.strip()]
 mesh = Mesh(np.array(devices).reshape(-1), ('fsdp',))
 batch_sharding = NamedSharding(mesh, P('fsdp', None) if N_DEV > 1 else P())
 
@@ -362,6 +369,49 @@ def data_key(stage_tag, step):
     return jax.random.fold_in(jax.random.PRNGKey(SEED), stage_tag * 10 ** 6 + step)
 
 
+_CE_CACHE = {}
+
+
+def heldout_ce(model, tr, fr, ids, n_windows=None, batch=None):
+    """M-001 v2: mean held-out CE (nat/token) over fixed windows; returns (mean, detail)."""
+    n_windows = n_windows or EVAL_WINDOWS; batch = batch or BATCH
+    starts = eval_window_starts(len(ids), SEQ, n_windows)
+    fn = _CE_CACHE.get(id(model))
+    if fn is None:
+        @jax.jit
+        def fn(a, b, window):
+            logits = model.apply({'params': merge(a, b)}, window[:, :-1])
+            return optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), window[:, 1:]).mean(axis=1)
+        _CE_CACHE[id(model)] = fn
+    values = []
+    for i in range(0, len(starts), batch):
+        part = starts[i:i + batch]; real = len(part)
+        part = np.concatenate([part, np.repeat(part[-1:], batch - real)])          # pad, then drop
+        window = np.stack([np.asarray(ids[s:s + SEQ + 1]) for s in part])
+        if batch % N_DEV == 0:
+            window = jax.device_put(window, batch_sharding)
+        values.extend(np.asarray(fn(tr, fr, window))[:real].tolist())
+    v = np.asarray(values, np.float64)
+    detail = dict(measurement='M-001.v2', windows=int(len(v)), tokens=int(len(v) * SEQ), mean=float(v.mean()),
+                  se=float(v.std(ddof=1) / math.sqrt(len(v))) if len(v) > 1 else None,
+                  starts_sha256=hashlib.sha256(starts.astype('<i8').tobytes()).hexdigest(),
+                  ids_sha256=hashlib.sha256(np.asarray(ids, '<i4').tobytes()).hexdigest())
+    return float(v.mean()), detail
+
+
+def unigram_ce(train_ids, ids, vocab, n_windows=None):
+    """M-002 v2: add-one unigram model fitted on train, scored on the M-001 v2 targets."""
+    counts = np.bincount(train_ids, minlength=vocab).astype(np.float64) + 1.0
+    starts = eval_window_starts(len(ids), SEQ, n_windows or EVAL_WINDOWS)
+    targets = np.concatenate([np.asarray(ids[s + 1:s + SEQ + 1]) for s in starts])
+    return float(np.mean(-np.log(counts[targets] / counts.sum())))
+
+
+def flops_report(model_cfg, abstract):
+    shapes = {k: tuple(v.shape) for k, v in flatten_dict(abstract, sep='/').items()}
+    return forward_flops(shapes, SEQ, model_cfg.n_heads, model_cfg.d_head, model_cfg.qk_rope_head_dim)
+
+
 def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, collect_gram, extra=None, eval_fn=None):
     """Shared training loop; returns (tr, final_op, report_dict). Optional periodic
     held-out CE (eval_fn, every EVAL_EVERY steps) and a graceful wall-clock budget."""
@@ -419,6 +469,11 @@ def run_stage(tag, model, tr, fr, tx, op, steps, ids, report_key, stage_tag, col
                 break
     rep['status'] = 'STOPPED_TIME_BUDGET' if stopped else 'COMPLETED'; rep['elapsed_seconds'] = time.monotonic() - t0
     rep['hbm'] = mem_guard.hbm_stats(jax.local_devices())
+    done = last.get('step', 0)
+    rep['steps_done'] = done; rep['train_tokens'] = done * BATCH * SEQ
+    per_token = REPORT.get('flops', {}).get(report_key)
+    if per_token:
+        rep['forward_flops_total'] = per_token * rep['train_tokens']
     if len(rep.get('metrics', [])) > 2000:   # keep report.json bounded; full trace is in *_metrics.jsonl
         m = rep['metrics']; rep['metrics'] = m[:500] + m[-1500:]; rep['metrics_truncated'] = {'kept': 2000, 'total': len(m), 'full': mpath.name}
     if last: rep['last'] = last
@@ -687,10 +742,11 @@ def run_pipeline():
                    'self_attn.f_a_proj.weight', 'self_attn.f_b_proj.weight', 'self_attn.A_log', 'self_attn.dt_bias', 'self_attn.o_norm.weight', 'input_layernorm.weight']
         MLA_SUF = ['self_attn.q_a_proj.weight', 'self_attn.q_b_proj.weight', 'self_attn.kv_a_proj_with_mqa.weight', 'self_attn.kv_b_proj.weight',
                    'self_attn.q_a_layernorm.weight', 'self_attn.kv_a_layernorm.weight', 'self_attn.o_proj.weight', 'self_attn.g_proj.weight', 'input_layernorm.weight']
-        BASE_FFN_LAYER = 1
+        base_ffn = BASE_FFN_LAYERS * base_cfg.num_blocks if len(BASE_FFN_LAYERS) == 1 else BASE_FFN_LAYERS
+        assert len(base_ffn) == base_cfg.num_blocks, f'K3_BASE_FFN_LAYERS needs 1 or {base_cfg.num_blocks} entries'
         need = [f'language_model.model.layers.{L}.{s}' for L in range(base_cfg.n_layers) for s in (MLA_SUF if L in base_cfg.mla_positions else KDA_SUF)]
-        pre_sh = f'language_model.model.layers.{BASE_FFN_LAYER}.block_sparse_moe.shared_experts'
-        need += [f'{pre_sh}.{w}.weight' for w in ('gate_proj', 'up_proj', 'down_proj')]
+        for t in sorted(set(base_ffn)):
+            need += [f'language_model.model.layers.{t}.block_sparse_moe.shared_experts.{w}.weight' for w in ('gate_proj', 'up_proj', 'down_proj')]
         need += ['language_model.model.embed_tokens.weight', 'language_model.model.norm.weight', 'language_model.lm_head.weight']
         missing = [n for n in need if n not in wm]
         if missing: raise KeyError(f'Missing required pretrained tensors: {missing}')
@@ -729,9 +785,11 @@ def run_pipeline():
         for L in range(base_cfg.n_layers):
             for k, v in (_mla if L in base_cfg.mla_positions else _kda)(L, H_s, Dh).items():
                 patch[f'block_{L // base_cfg.layers_per_block}/layer_{L}/{k}'] = v
-        G, U, Dn = (f32(tensors[f'{pre_sh}.{w}.weight']) for w in ('gate_proj', 'up_proj', 'down_proj'))
         for bi in range(base_cfg.num_blocks):
+            sh = f'language_model.model.layers.{base_ffn[bi]}.block_sparse_moe.shared_experts'
+            G, U, Dn = (f32(tensors[f'{sh}.{w}.weight']) for w in ('gate_proj', 'up_proj', 'down_proj'))
             patch[f'block_{bi}/ffn/gate_proj/kernel'] = G.T; patch[f'block_{bi}/ffn/up_proj/kernel'] = U.T; patch[f'block_{bi}/ffn/down_proj/kernel'] = Dn.T
+        REPORT['base_ffn_layers'] = base_ffn
         patch['embed/embedding'] = tensors['language_model.model.embed_tokens.weight']
         patch['final_norm/scale'] = tensors['language_model.model.norm.weight']
         patch['lm_head/kernel'] = tensors['language_model.lm_head.weight'].T
@@ -763,28 +821,27 @@ def run_pipeline():
 
     params_base = jax.device_put(params_host, sharded_like(base_abstract))
     pflat = flatten_dict(params_base, sep='/')
-    mask1 = trainable_mask(pflat, 'new', [], extra_prefixes=('lm_head/',) if S1_TRAINABLE == 'new_lm_head' else ())
+    assert all(0 <= b < base_cfg.num_blocks for b in S1_TRAIN_BLOCKS), 'K3_S1_TRAIN_BLOCKS out of range'
+    mask1 = trainable_mask(pflat, 'blocks' if S1_TRAIN_BLOCKS else 'new', S1_TRAIN_BLOCKS,
+                           extra_prefixes=('lm_head/',) if S1_TRAINABLE == 'new_lm_head' else ())
+    REPORT['flops'] = {'measurement': 'M-009.v1', 'S1_base': flops_report(base_cfg, base_abstract)['total']}
     tr1 = reshard_host(to_master(unflatten_dict({k: pflat[k] for k in pflat if mask1[k]}, sep='/')))
     fr1 = reshard_host(unflatten_dict({k: pflat[k] for k in pflat if not mask1[k]}, sep='/'))
     del params_base, pflat, params_host
     gc.collect()
     tx1 = make_tx(tr1); op1 = tx1.init(tr1)
 
-    def eval_ce(model, tr, fr, ids, n_batches=2):
-        @jax.jit
-        def ce(a, b, batch):
-            full = merge(a, b)
-            logits = model.apply({'params': full}, batch[:, :-1])
-            return optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), batch[:, 1:]).mean()
-        vals = [float(ce(tr, fr, jax.device_put(sample(ids, data_key(99, i), BATCH, SEQ), batch_sharding))) for i in range(n_batches)]
-        return float(np.mean(vals))
+    def eval_ce(model, tr, fr, ids):
+        value, detail = heldout_ce(model, tr, fr, ids)
+        REPORT['eval_last'] = detail
+        return value
 
     ce0 = eval_ce(base_model, tr1, fr1, val_ids)
-    counts = np.bincount(train_ids, minlength=base_cfg.vocab).astype(np.float64) + 1.0
-    uni_ce = float(np.mean(-np.log((counts[train_ids[:200000]] / counts.sum()))))
+    uni_ce = unigram_ce(train_ids, val_ids, base_cfg.vocab)
     threshold = min(math.log(base_cfg.vocab), uni_ce)
-    REPORT['S1_reference'] = {'ce0_val': ce0, 'unigram_ce_train': uni_ce, 'stop_threshold': threshold,
-                              's1_trainable': S1_TRAINABLE, 'gate_bypassed': False}; save_rpt()
+    REPORT['S1_reference'] = {'ce0_val': ce0, 'ce0_detail': REPORT['eval_last'], 'unigram_ce_val': uni_ce, 'stop_threshold': threshold,
+                              's1_trainable': S1_TRAINABLE, 's1_train_blocks': S1_TRAIN_BLOCKS, 'global_batch': BATCH,
+                              'gate_bypassed': False}; save_rpt()
     chk('S1', 'finite_ce0', np.isfinite(ce0), ce0)
     if RUN == 'real' and ce0 >= threshold:
         if not ALLOW_HIGH_CE0:
@@ -812,7 +869,7 @@ def run_pipeline():
             f'language_model.model.layers.{t}.block_sparse_moe.shared_experts.{w}.weight' in wm for w in ('gate_proj', 'up_proj', 'down_proj'))]
         plan = build_growth_plan(N_BASE, TARGET, candidates, strategy='depth_proportional')
         for entry in plan:
-            if entry['role'] == 'base': entry['ffn_source'] = BASE_FFN_LAYER   # report what S1 actually loaded
+            if entry['role'] == 'base': entry['ffn_source'] = base_ffn[entry['block'] // 4]   # report what S1 actually loaded
     else:
         plan = build_growth_plan(N_BASE, TARGET, list(range(N_BASE, TARGET)), strategy='spread')
         for entry in plan:
@@ -834,6 +891,8 @@ def run_pipeline():
                               qk_rope_head_dim=base_cfg.qk_rope_head_dim, d_ff=base_cfg.d_ff, dar_latent=base_cfg.dar_latent)
     grown_model = StudentLM(cfg=grown_cfg)
     grown_abstract = jax.eval_shape(lambda r: grown_model.init(r, ids_small)['params'], jax.random.PRNGKey(0))
+    grown_flops = flops_report(grown_cfg, grown_abstract)['total']
+    REPORT['flops'].update(S3_warmup=grown_flops, S4_full=grown_flops)
     gflat = flatten_dict(jax.device_get(grown_abstract), sep='/')
     h1 = flatten_dict(jax.device_get(merge(tr1, fr1)), sep='/')   # S1-TRAINED state (not the pre-S1 init)
 

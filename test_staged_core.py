@@ -75,6 +75,19 @@ check('cka_grad_finite_and_flows', bool(jnp.isfinite(gA).all()) and float(jnp.ab
 jit_pen = jax.jit(lambda r, k: sc.cka_penalty(r, 1.0, [(2, 0)], 32, k)[0])(reps, 5)
 check('cka_jit_with_traced_key', bool(jnp.isfinite(jit_pen)))
 
+# 5c) M-009 FLOP accounting and M-001 v2 windows
+shapes = {'block_0/layer_0/mixer/q_proj/kernel': (10, 8), 'block_0/layer_0/mixer/erase_gate/kernel': (10, 8),
+          'block_0/layer_0/mixer/q_conv_w': (8, 4), 'block_0/layer_3/mixer/kv_b_proj/kernel': (3, 16),
+          'embed/embedding': (100, 10), 'lm_head/kernel': (10, 100), 'final_norm/scale': (10,)}
+fl = sc.forward_flops(shapes, seq=9, n_heads=2, d_head=4, qk_rope_dim=2)
+check('flops_dense_is_two_in_out', fl['dense'] == 2 * (10 * 8 + 10 * 8 + 3 * 16 + 10 * 100), str(fl['dense']))
+check('flops_conv', fl['conv'] == 2 * 8 * 4)
+check('flops_gdn_state', fl['gdn_layers'] == 1 and fl['gdn_state'] == 7 * 2 * 4 * 4)
+check('flops_mla_attention', fl['mla_layers'] == 1 and fl['mla_attention'] == 5.0 * (2 * 2 * 6 + 2 * 2 * 4))
+check('flops_total_is_sum', fl['total'] == fl['dense'] + fl['conv'] + fl['gdn_state'] + fl['mla_attention'])
+w = sc.eval_window_starts(1000, 64, 5)
+check('eval_windows_deterministic_in_range', w.tolist() == sc.eval_window_starts(1000, 64, 5).tolist() and w[0] == 0 and w[-1] == 1000 - 65, str(w.tolist()))
+
 # 6) report contract
 rep = sc.stage_report_template(plan, {'lambda_orth': 1e-2})
 check('stage_report_contract', all(s in rep['stages'] for s in ('S1_base', 'S2_growth', 'S3_warmup', 'S4_full'))
